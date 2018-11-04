@@ -9,14 +9,16 @@ use std;
 use remacs_macros::lisp_fn;
 
 use remacs_sys::EmacsInt;
-use remacs_sys::{buffer_overflow, build_string, downcase, find_before_next_newline, find_field,
-                 find_newline, globals, insert, insert_and_inherit, insert_from_buffer,
-                 make_buffer_string_both, make_string_from_bytes, maybe_quit, message1,
+use remacs_sys::{buffer_overflow, build_string, copy_intervals_to_string, downcase,
+                 find_before_next_newline, find_field, find_newline, globals, insert,
+                 insert_and_inherit, insert_from_buffer, make_number, make_string_from_bytes,
+                 make_uninit_multibyte_string, make_uninit_string, maybe_quit, message1,
                  scan_newline_from_point, set_buffer_internal_1, set_point, set_point_both,
                  update_buffer_properties};
 use remacs_sys::{Fadd_text_properties, Fcons, Fcopy_sequence, Fformat_message, Fget_pos_property,
-                 Fx_popup_dialog};
+                 Fnext_property_change, Ftext_properties_at, Fx_popup_dialog};
 use remacs_sys::{Qfield, Qinteger_or_marker_p, Qmark_inactive, Qnil, Qt};
+use remacs_sys::{SDATA, XINT};
 
 use buffers::{LispBufferOrCurrent, LispBufferOrName, LispBufferRef, BUF_BYTES_MAX};
 use character::{char_head_p, dec_pos};
@@ -936,7 +938,81 @@ pub fn buffer_string() -> LispObject {
     let zv = cur_buf.zv;
     let zv_byte = cur_buf.zv_byte;
 
-    unsafe { make_buffer_string_both(begv, begv_byte, zv, zv_byte, true) }
+    unsafe { rust_make_buffer_string_both(begv, begv_byte, zv, zv_byte, true) }
+}
+
+/// Return a Lisp_String containing the text of the current buffer from
+/// START / START_BYTE to END / END_BYTE.
+///
+/// If text properties are in use and the current buffer
+/// has properties in the range specified, the resulting string will also
+/// have them, if PROPS is true.
+///
+/// We don't want to use plain old make_string here, because it calls
+/// make_uninit_string, which can cause the buffer arena to be
+/// compacted.  make_string has no way of knowing that the data has
+/// been moved, and thus copies the wrong data into the string.  This
+/// doesn't effect most of the other users of make_string, so it should
+/// be left as is.  But we should use this function when conjuring
+/// buffer substrings.  */
+#[no_mangle]
+pub unsafe extern "C" fn rust_make_buffer_string_both(
+    start: ptrdiff_t,
+    start_byte: ptrdiff_t,
+    end: ptrdiff_t,
+    end_byte: ptrdiff_t,
+    props: bool,
+) -> LispObject {
+    let mut cur_buf = ThreadState::current_buffer();
+    let mut result = Qnil;
+    let mut temp = Qnil;
+    let mut temp1 = Qnil;
+
+    let mut beg0 = start_byte;
+    let mut end0 = end_byte;
+    let mut beg1 = -1;
+    let mut end1 = -1;
+    let mut size = 0;
+
+    let beg_byte = cur_buf.beg_byte();
+    let gpt_byte = cur_buf.gpt_byte();
+    let gap_size = cur_buf.gap_size();
+
+    if start_byte < gpt_byte && gpt_byte < end_byte {
+        end0 = gpt_byte;
+        beg1 = gpt_byte + gap_size - beg_byte;
+    }
+
+    if cur_buf.multibyte_characters_enabled() {
+        result = make_uninit_multibyte_string((end - start) as i64, (end_byte - start_byte) as i64)
+    } else {
+        result = make_uninit_string((end - start) as i64)
+    }
+
+    size = end0 - beg0;
+
+    ptr::copy(cur_buf.byte_pos_addr(beg0), SDATA(result), size as usize);
+
+    if beg1 != -1 {
+        ptr::copy(
+            &(cur_buf.beg() + beg1),
+            SDATA(result).offset(size) as *mut isize,
+            (end1 - beg1) as usize,
+        );
+    }
+
+    if props {
+        update_buffer_properties(beg0, end0);
+
+        temp = Fnext_property_change(make_number(start as i64), Qnil, make_number(end as i64));
+        temp1 = Ftext_properties_at(make_number(start as i64), Qnil);
+
+        if XINT(temp) != end as i64 || !temp1.is_nil() {
+            copy_intervals_to_string(result, cur_buf.as_mut(), start, end - start);
+        }
+    }
+
+    result
 }
 
 include!(concat!(env!("OUT_DIR"), "/editfns_exports.rs"));
